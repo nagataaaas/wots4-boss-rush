@@ -9,6 +9,24 @@ Once you have seen the true route's ending, "The Light of Hope", the Specter in 
 
 https://github.com/user-attachments/assets/f9b8cdfe-91cd-4776-8035-d689243c0d03
 
+## How to play
+
+After seeing "The Light of Hope", talk to the Specter in the graveyard, choose "Fight the strong" and pick your opponents. You are taken into an empty graveyard where the strong await, and the gauntlet begins.
+
+| Choice | Unlocked by |
+| --- | --- |
+| Fight the strong of the Prajnas | Seeing "The Light of Hope" |
+| Fight the strong of the Shogunate | Seeing "The Light of Hope" |
+| Fight the strong of the foreigners | Seeing "The Light of Hope" |
+| Fight the Four Samurai Lords (except Kumagami) | Clearing the occupation "Four Samurai Lords vs. Yakuza Quartet" |
+| Fight the Yakuza Quartet | Clearing the occupation "Four Samurai Lords vs. Yakuza Quartet" |
+| Fight the Amihama Eight | Clearing the occupation "The Amihama Eight" |
+
+Conditions met in earlier playthroughs count too.
+
+- During a boss rush, you cannot walk out of the graveyard.
+- The strong you defeat in a boss rush do not die in the story.
+
 ## Installation
 
 ### Automatic installation (recommended)
