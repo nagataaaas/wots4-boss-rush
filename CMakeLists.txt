@@ -15,7 +15,7 @@ endif()
 # Use the Mod's folder name in the game folder (mods/<name>/) as <name>
 wots4_use_minhook()
 wots4_add_mod(boss_rush SOURCES src/mod.cpp src/rush.cpp src/game_actors.cpp src/exit_lock.cpp src/travel.cpp DEF src/mod.def
-    LIBS wots4_minhook NO_RELEASE)
+    LIBS wots4_minhook)
 target_include_directories(mod_boss_rush PRIVATE src)
 target_compile_definitions(mod_boss_rush PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
