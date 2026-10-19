@@ -32,8 +32,8 @@ constexpr wots4::LocalizedText kinugawa{L"鬼怒川 怨仙", L"Onsen Kinugawa"};
 constexpr wots4::LocalizedText melinda{L"メリンダ", L"Melinda"};
 constexpr wots4::LocalizedText newCommander{L"新隊長", L"New Commander"};
 constexpr wots4::LocalizedText jj{L"J.J", L"J.J."};
-constexpr wots4::LocalizedText shitenno{L"四天王", L"The Shitenno"};
-constexpr wots4::LocalizedText yoningumi{L"四人組", L"The Yoningumi"};
+constexpr wots4::LocalizedText shitenno{L"四天王", L"The Four Samurai Lords"};
+constexpr wots4::LocalizedText yoningumi{L"四人組", L"The Yakuza Quartet"};
 
 // Definitions: 小暮 69, まだら 70, 赤城 46, 茂呂 640 (with a sword; 65 fights bare-handed),
 // 琴吹 64, 万由 445, 千佳 446, 百合 447 (in fighting clothes; 66/87/88 wear kimonos), 鬼怒川 67,
@@ -50,7 +50,7 @@ inline RushRoster rosterOf(RushGroup group) {
     case RushGroup::foreigners:
         return {{{{68}, 1, melinda}, {{522}, 1, newCommander}, {{44}, 1, jj}}, 3};
     case RushGroup::shitenno:
-        return {{{{330}, 1, fightersName}, {{331}, 1, fightersName}, {{338}, 1, fightersName}, {{329}, 1, fightersName}}, 4};
+        return {{{{330}, 1, fightersName}, {{331}, 1, fightersName}, {{329}, 1, fightersName}}, 3};
     case RushGroup::yoningumi:
         return {{{{334}, 1, fightersName}, {{333}, 1, fightersName}, {{332}, 1, fightersName}, {{335}, 1, fightersName}}, 4};
     case RushGroup::amihamaEight:

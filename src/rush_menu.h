@@ -10,7 +10,7 @@ enum class RushGroup : uint8_t {
     joui,          // 小暮, まだら, 赤城
     shogunate,     // 茂呂, 琴吹, 鬼怒川三姉妹, 鬼怒川, 鬼怒川 (boiled)
     foreigners,    // メリンダ, the new captain, J.J
-    shitenno,      // 虎鉄, 大蛇, 熊神, 霧鮫
+    shitenno,      // 虎鉄, 大蛇, 霧鮫 (熊神 fights only among the Amihama Eight)
     yoningumi,     // 鈴目, 緋横, 小鳩, 百舌
     amihamaEight,  // the boss, the Shitenno, the Yoningumi, the commander
 };
@@ -60,14 +60,14 @@ inline RushMenuItems menuItems(RushMenu menu, const Unlocks& unlocks) {
         items.add(opens({L"町の強者と戦う", L"Fight the strong of the town"}, RushMenu::town));
         break;
     case RushMenu::factions:
-        items.add(starts({L"攘夷の強者と戦う", L"Fight the strong of the Joui"}, RushGroup::joui));
+        items.add(starts({L"攘夷の強者と戦う", L"Fight the strong of the Prajnas"}, RushGroup::joui));
         items.add(starts({L"幕府の強者と戦う", L"Fight the strong of the Shogunate"}, RushGroup::shogunate));
         items.add(starts({L"外国の強者と戦う", L"Fight the strong of the foreigners"}, RushGroup::foreigners));
         break;
     case RushMenu::town:
         if (unlocks.shitennoVsYoningumi) {
-            items.add(starts({L"四天王と戦う", L"Fight the Shitenno"}, RushGroup::shitenno));
-            items.add(starts({L"四人組と戦う", L"Fight the Yoningumi"}, RushGroup::yoningumi));
+            items.add(starts({L"四天王(熊神除く)と戦う", L"Fight the Four Samurai Lords (except Kumagami)"}, RushGroup::shitenno));
+            items.add(starts({L"四人組と戦う", L"Fight the Yakuza Quartet"}, RushGroup::yoningumi));
         }
         if (unlocks.amihamaEight) items.add(starts({L"八人衆と戦う", L"Fight the Amihama Eight"}, RushGroup::amihamaEight));
         break;

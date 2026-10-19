@@ -71,7 +71,7 @@ void checkMenus() {
     const RushMenuItems sides = menuItems(RushMenu::sides, shitenno);
     check("the sides open the factions and the town", sides.count == 2 && sides.items[0].opensMenu &&
         sides.items[0].menu == RushMenu::factions && sides.items[1].menu == RushMenu::town);
-    check("the town after 四天王 対 四人組", labels(menuItems(RushMenu::town, shitenno)) == L"四天王と戦う|四人組と戦う");
+    check("the town after 四天王 対 四人組", labels(menuItems(RushMenu::town, shitenno)) == L"四天王(熊神除く)と戦う|四人組と戦う");
 
     Unlocks eight = none;
     eight.amihamaEight = true;
@@ -79,16 +79,17 @@ void checkMenus() {
     check("the town after あみはま八人衆", labels(menuItems(RushMenu::town, eight)) == L"八人衆と戦う");
     eight.shitennoVsYoningumi = true;
     const RushMenuItems town = menuItems(RushMenu::town, eight);
-    check("the town after both", labels(town) == L"四天王と戦う|四人組と戦う|八人衆と戦う" &&
+    check("the town after both", labels(town) == L"四天王(熊神除く)と戦う|四人組と戦う|八人衆と戦う" &&
         town.items[2].group == RushGroup::amihamaEight);
+    bool labelsFit = true;
     for (RushMenu menu : {RushMenu::sides, RushMenu::factions, RushMenu::town}) {
         const RushMenuItems items = menuItems(menu, eight);
         for (uint32_t i = 0; i < items.count; ++i) {
-            if (wcslen(items.items[i].label.english) > wots4::maxConversationTextChars ||
-                wcslen(items.items[i].label.japanese) > wots4::maxConversationTextChars)
-                check("every label fits a conversation line", false);
+            labelsFit &= wcslen(items.items[i].label.english) <= wots4::maxConversationTextChars &&
+                wcslen(items.items[i].label.japanese) <= wots4::maxConversationTextChars;
         }
     }
+    check("every label fits a conversation line", labelsFit);
 }
 
 uint32_t fightersOf(RushGroup group) {
@@ -110,9 +111,16 @@ void checkRosters() {
     check("the new commander in armor (522)", rosterOf(RushGroup::foreigners).stages[1].definitions[0] == 522);
     check("the foreigners end with J.J", rosterOf(RushGroup::foreigners).stages[2].definitions[0] == 44);
     check("the Shitenno and the Yoningumi fight one by one",
-        fightersOf(RushGroup::shitenno) == 4 && rosterOf(RushGroup::shitenno).stageCount == 4 &&
+        fightersOf(RushGroup::shitenno) == 3 && rosterOf(RushGroup::shitenno).stageCount == 3 &&
             fightersOf(RushGroup::yoningumi) == 4 && rosterOf(RushGroup::yoningumi).stageCount == 4);
+    constexpr uint32_t kumagami = 338;
+    const RushRoster shitenno = rosterOf(RushGroup::shitenno);
+    bool shitennoHasKumagami = false;
+    for (uint32_t i = 0; i < shitenno.stageCount; ++i) shitennoHasKumagami |= shitenno.stages[i].definitions[0] == kumagami;
+    check("the Shitenno without 熊神: 虎鉄, 大蛇, 霧鮫", !shitennoHasKumagami && shitenno.stages[0].definitions[0] == 330 &&
+        shitenno.stages[1].definitions[0] == 331 && shitenno.stages[2].definitions[0] == 329);
     const RushRoster eight = rosterOf(RushGroup::amihamaEight);
+    check("熊神 still fights among the Amihama Eight", eight.stages[1].definitions[2] == kumagami);
     check("the Amihama Eight: the boss, 4 together, 4 together, the commander",
         eight.stageCount == 4 && eight.stages[0].definitions[0] == 286 && eight.stages[1].fighterCount == 4 &&
             eight.stages[2].fighterCount == 4 && eight.stages[3].definitions[0] == 337);

@@ -1,7 +1,6 @@
 // Addresses are virtual addresses of the supported Steam exe (ImageBase 0x400000). The
 // functions take their arguments in registers; each wrapper says how.
 #include "game_actors.h"
-#include <cmath>
 #include <cstring>
 
 namespace boss_rush::game {
@@ -14,16 +13,22 @@ constexpr uintptr_t gameState = 0x9e967c;           // cpGParamMng*: the save's 
 constexpr uintptr_t appendCharacters = 0x9e9640;    // The manager of the characters brought into an area
 constexpr uintptr_t characterManager = 0x9e9658;    // Every actor by ID
 constexpr uintptr_t actionScripts = 0x9e95d0;       // The brains by actor ID
-constexpr uintptr_t mapManager = 0x9e96bc;          // +4: the loaded map, whose +4 is its ID
+constexpr uintptr_t mapManager = 0x9e96bc;
+constexpr uintptr_t mapData = 0x9e96b8;             // The areas' entrances
 constexpr uintptr_t eventSystem = 0x9eb5f8;
 constexpr uintptr_t eventBattle = 0x9eb5e4;
-constexpr uintptr_t notifications = 0x9ebb8c;       // +0x30: the notification queue
+constexpr uintptr_t notifications = 0x9ebb8c;       // CUIManager
 constexpr uintptr_t textManager = 0x9e9680;
 
+constexpr uint32_t mapManagerLoadedMap = 0x04;
+constexpr uint32_t mapId = 0x04;                     // The low 16 bits
+constexpr uint32_t uiManagerNotificationQueue = 0x30;
+constexpr uint32_t notificationQueueReady = 0x0c;    // Null until the queue's panel is built
 // Functions
 constexpr uintptr_t queueAppendCharacter = 0x43a990;  // ecx = definition, ebx = &position, push context, flags, manager; ret 0xc
 constexpr uintptr_t placeAppendCharacter = 0x43a900;  // eax = ID, push &position, manager; ret 8
 constexpr uintptr_t findCharacterEntry = 0x465590;    // ecx = character manager, esi = ID; eax = entry
+constexpr uintptr_t pickRandomEntrance = 0x507960;    // eax = area, edx = map data; eax = 20-byte record or null
 // The points the game's off-screen enemies (WakiZako) run in from, as 0x435fb6 reads them.
 constexpr uintptr_t findRunInPoints = 0x43ca10;       // ecx = point data, bx = map ID; eax = the points
 constexpr uintptr_t countRunInPoints = 0x43ca80;      // ecx = point data, di = map ID; eax = how many
@@ -41,8 +46,21 @@ constexpr uintptr_t setBodyPinned = 0x526dd0;         // edi = physics, ebx = bo
 constexpr uintptr_t physicsManager = 0x9ecf60;
 constexpr uint32_t entryMotion = 0x20;
 constexpr uint32_t motionPinnedMode = 0xac;           // 0: free
-constexpr uint32_t motionBody = 0x134;                // +0x84: the body's number, below 0x40
-constexpr uintptr_t makeGameString = 0x407a90;        // ecx = UTF-16 text, push string storage; ret 4
+constexpr uint32_t motionBody = 0x134;
+constexpr uint32_t bodyNumber = 0x84;                // Below 0x40
+// A sword drawn before its model is built keeps its sheath: the attachment (0x693e90) only
+// records the sheath's joint until the model is built (weapon +0x1c 0x200, 0x692340), and the
+// build then attaches the sheath to the sword (0x6921ea). A boss of the rush draws at once.
+constexpr uintptr_t attachDrawnWeapon = 0x498560;    // stdcall(entry); ret 4: the sword to the hand, the sheath to the waist
+constexpr uint32_t paramWeaponInHand = 0x2d5;        // byte; set by 0x498560, cleared by 0x4987f0
+constexpr uint32_t paramWeapons = 0x18c;             // 3 slots of 8 bytes, the weapon object first
+constexpr uint32_t paramCurrentWeaponSlot = 0x2c4;
+constexpr uint32_t paramSecondWeaponSlot = 0x2c8;    // With a second sword (+0x2d7)
+constexpr uint32_t paramHasSecondWeapon = 0x2d7;     // byte
+constexpr uint32_t weaponSlots = 3;
+constexpr uint32_t weaponModelFlags = 0x1c;
+constexpr uint32_t weaponModelBuilt = 0x200;
+constexpr uintptr_t makeGameString = 0x407a90;      // ecx = UTF-16 text, push string storage; ret 4
 constexpr uintptr_t queueNotification = 0x5c3ea0;     // esi = queue, bl = 0, push duration, string; ret 8
 constexpr uintptr_t freeGameString = 0x407ff0;        // ecx = string storage
 
@@ -66,9 +84,26 @@ constexpr uint32_t runInPointPosition = 0x04;        // float[3]
 // The map's entrances lie outside the walkable ground, where a fighting brain cannot find its
 // way in; the run-in points are inside it. The nearest one at this distance or more.
 constexpr float minimumRunInDistance = 20.0f;
+// A boss comes from this far, out of the camera's sight: the game chooses fighting targets within
+// 150 units (0x440a50), and farther out a fighter keeps none (battle flags 0x1000 and 0x2000).
+constexpr float minimumHiddenDistance = 50.0f;
+constexpr float maximumHiddenDistance = 110.0f;
+// The camera, as the off-screen enemies' spawner reads it (0x435ec3, 0x435f57): a point is out of
+// sight when it is behind the camera, the direction to it against the view (0x435fff, 0x97c804 = 0).
+constexpr uintptr_t cameraManager = 0x9e964c;
+constexpr uint32_t cameraManagerCurrentIndex = 0x04; // -1 without a camera
+constexpr uint32_t cameraManagerCameras = 0x08;      // Camera* each
+// thiscall vtable methods returning const float[3]. Written as offsets in the call below.
+[[maybe_unused]] constexpr uint32_t cameraEyeMethod = 0x20;
+[[maybe_unused]] constexpr uint32_t cameraLookAtMethod = 0x24;
 constexpr float fallbackOffset = 10.0f;              // Without points: beside the player, on walkable ground
 constexpr uint32_t scriptsBrainsHeader = 0x0c;       // std::map<int, Brain*> by actor ID: header, then root
 constexpr uint32_t scriptsBrainsRoot = 0x10;
+// A node of that map, as 0x54b098 walks it
+constexpr uint32_t brainNodeLeft = 0x08;             // Actor IDs below the node's
+constexpr uint32_t brainNodeRight = 0x0c;
+constexpr uint32_t brainNodeActor = 0x10;
+constexpr uint32_t brainNodeBrain = 0x14;
 constexpr uint32_t paramFlags = 0x114;               // 0x600000: dead
 constexpr uint32_t deadFlags = 0x600000;
 // Battle flags. The game's target manager (0x43f520) rewrites the others every frame (chase by
@@ -93,7 +128,6 @@ constexpr uint32_t paramHp = 0x1f8;                  // float; the game's own ch
 constexpr uint32_t paramMinimumHp = 0x328;           // The cut stops at this; the main characters have 1
 constexpr uint32_t paramName = 0x2e8;
 constexpr uint32_t paramPosition = 0xd4;             // float[3], as the game's distance (0x41c960) reads it
-constexpr uint32_t paramOrientation = 0xa4;          // float[3][3]; a new actor faces +z
 // The side in a fight: two actors whose groups are both set are allies only in the same group;
 // otherwise the same character type makes allies (0x4d7340). It keeps the bosses of a stage on
 // one side and the player on the other.
@@ -104,14 +138,15 @@ constexpr uint32_t aiMovements = 0x18;               // The AI's movements: curr
 constexpr uint32_t movementsCurrent = 0x00;
 constexpr uint32_t movementsNext = 0x04;
 constexpr uint32_t movementsDefault = 0x10;
-constexpr uint32_t brainState = 0x24;               // The function it runs (0x4097e6)
-constexpr uint32_t brainTarget = 0x44;                // const wchar_t*
 constexpr uint32_t nameChars = 32;
 constexpr uint32_t textLanguage = 0x4c;              // 0: Japanese
 // Flags of queueAppendCharacter: none, as an event script brings in a character (0x549df0). With
-// 0x20000 or 0x40000 the brain comes in as a townsperson passing through (0x43a234), and walks
-// its way however it is ordered. Written as an immediate in the call below.
+// 0x20000 or 0x40000 the brain comes in as a townsperson walking through (0x43a234). Written as
+// an immediate in the call below.
 [[maybe_unused]] constexpr uint32_t noAppendFlags = 0;
+constexpr uint32_t entrancePosition = 0x04;          // float[3] of the 20-byte entrance record
+// The game's picker is random; enough tries find the entrances near the player.
+constexpr uint32_t entranceTries = 24;
 [[maybe_unused]] constexpr int32_t noContext = -1;
 // BattleMob: its death function only drops its belongings, unlike the bosses' own scripts,
 // which write their story flags when they die.
@@ -162,24 +197,28 @@ void* brainOf(int32_t actor) {
     uint8_t* scripts = global<uint8_t*>(actionScripts);
     if (!scripts) return nullptr;
     uint8_t* header = scripts + scriptsBrainsHeader;
-    uint8_t* node = at<uint8_t*>(scripts, scriptsBrainsRoot);
-    uint8_t* candidate = header;
-    while (node) {
-        if (at<int32_t>(node, 0x10) >= actor) {
-            candidate = node;
-            node = at<uint8_t*>(node, 0x08);
-        } else {
-            node = at<uint8_t*>(node, 0x0c);
+    __try {
+        uint8_t* node = at<uint8_t*>(scripts, scriptsBrainsRoot);
+        uint8_t* candidate = header;
+        while (node) {
+            if (at<int32_t>(node, brainNodeActor) >= actor) {
+                candidate = node;
+                node = at<uint8_t*>(node, brainNodeLeft);
+            } else {
+                node = at<uint8_t*>(node, brainNodeRight);
+            }
         }
+        if (candidate == header || at<int32_t>(candidate, brainNodeActor) != actor) return nullptr;
+        return at<void*>(candidate, brainNodeBrain);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
     }
-    if (candidate == header || at<int32_t>(candidate, 0x10) != actor) return nullptr;
-    return at<void*>(candidate, 0x14);
 }
 
 int32_t loadedMapId() {
     uint8_t* manager = global<uint8_t*>(mapManager);
-    uint8_t* map = manager ? at<uint8_t*>(manager, 4) : nullptr;
-    return map ? at<int32_t>(map, 4) & 0xffff : -1;
+    uint8_t* map = manager ? at<uint8_t*>(manager, mapManagerLoadedMap) : nullptr;
+    return map ? at<int32_t>(map, mapId) & 0xffff : -1;
 }
 
 float distanceSquared(const float* a, const float* b) {
@@ -222,8 +261,6 @@ const uint8_t* runInPoints(uint32_t& count) {
     return points;
 }
 
-}  // namespace
-
 bool isTaken(const float* point, const float (*taken)[3], uint32_t takenCount) {
     constexpr float samePoint = 1.0f;
     for (uint32_t i = 0; i < takenCount; ++i) {
@@ -232,28 +269,153 @@ bool isTaken(const float* point, const float (*taken)[3], uint32_t takenCount) {
     return false;
 }
 
-SpawnPoint pickSpawnPoint(float (&position)[3], uint32_t& runInPointCount, const float (*taken)[3], uint32_t takenCount) {
-    uint8_t* player = actorParam(playerActor);
-    runInPointCount = 0;
-    if (!player) return SpawnPoint::none;
-    float playerPosition[3];
-    memcpy(playerPosition, player + paramPosition, sizeof(playerPosition));
-    const uint8_t* points = runInPoints(runInPointCount);
+// The run-in point nearest the player at least 20 units away, else beside the player.
+void pickNearestRunInPoint(const float (&playerPosition)[3], float (&position)[3], const float (*taken)[3],
+    uint32_t takenCount) {
+    uint32_t count = 0;
+    const uint8_t* points = runInPoints(count);
     const float* best = nullptr;
     float bestDistance = 0;
-    for (uint32_t i = 0; i < runInPointCount; ++i) {
-        const auto point = reinterpret_cast<const float*>(points + i * runInPointSize + runInPointPosition);
-        const float distance = distanceSquared(point, playerPosition);
-        if (distance < minimumRunInDistance * minimumRunInDistance || (best && distance >= bestDistance)) continue;
-        if (isTaken(point, taken, takenCount)) continue;
-        best = point;
-        bestDistance = distance;
+    __try {
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto point = reinterpret_cast<const float*>(points + i * runInPointSize + runInPointPosition);
+            const float distance = distanceSquared(point, playerPosition);
+            if (distance < minimumRunInDistance * minimumRunInDistance || (best && distance >= bestDistance)) continue;
+            if (isTaken(point, taken, takenCount)) continue;
+            best = point;
+            bestDistance = distance;
+        }
+        if (best) memcpy(position, best, sizeof(position));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        best = nullptr;
     }
-    const SpawnPoint kind = best ? SpawnPoint::runIn : SpawnPoint::besidePlayer;
-    memcpy(position, best ? best : playerPosition, sizeof(position));
-    if (!best) position[0] += fallbackOffset * (takenCount + 1);
+    if (!best) {
+        memcpy(position, playerPosition, sizeof(position));
+        position[0] += fallbackOffset * (takenCount + 1);
+    }
     position[1] += spawnHeightOffset;
-    return kind;
+}
+
+const float* randomEntrance() {
+    uint8_t* state = global<uint8_t*>(gameState);
+    void* map = global<void*>(mapData);
+    if (!state || !map) return nullptr;
+    const int32_t area = static_cast<int8_t>(state[stateArea]);
+    const uintptr_t pick = address(pickRandomEntrance);
+    const uint8_t* entrance = nullptr;
+    __try {
+        __asm {
+            mov eax, area
+            mov edx, map
+            call pick
+            mov entrance, eax
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    return entrance ? reinterpret_cast<const float*>(entrance + entrancePosition) : nullptr;
+}
+
+bool cameraView(float (&eye)[3], float (&view)[3]) {
+    uint8_t* manager = global<uint8_t*>(cameraManager);
+    if (!manager) return false;
+    const int32_t index = at<int32_t>(manager, cameraManagerCurrentIndex);
+    if (index < 0) return false;
+    void* camera = at<void*>(manager, cameraManagerCameras + index * sizeof(void*));
+    if (!camera) return false;
+    const float* eyePosition = nullptr;
+    const float* lookAt = nullptr;
+    __try {
+        __asm {
+            mov ecx, camera
+            mov eax, [ecx]
+            call dword ptr [eax + 0x20]   ; cameraEyeMethod
+            mov eyePosition, eax
+            mov ecx, camera
+            mov eax, [ecx]
+            call dword ptr [eax + 0x24]   ; cameraLookAtMethod
+            mov lookAt, eax
+        }
+        if (!eyePosition || !lookAt) return false;
+        for (int axis = 0; axis < 3; ++axis) {
+            eye[axis] = eyePosition[axis];
+            view[axis] = lookAt[axis] - eyePosition[axis];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+float alongView(const float* point, const float (&eye)[3], const float (&view)[3]) {
+    return (point[0] - eye[0]) * view[0] + (point[1] - eye[1]) * view[1] + (point[2] - eye[2]) * view[2];
+}
+
+}  // namespace
+
+bool pickSpawnPoint(const float* side, float (&position)[3], const float (*taken)[3], uint32_t takenCount) {
+    uint8_t* player = actorParam(playerActor);
+    if (!player) return false;
+    float playerPosition[3];
+    memcpy(playerPosition, player + paramPosition, sizeof(playerPosition));
+    float eye[3], view[3];
+    const bool seen = cameraView(eye, view);
+    uint32_t count = 0;
+    const uint8_t* points = runInPoints(count);
+    // Out of sight first, then toward the side; with no point out of sight, the least in sight.
+    const float* best = nullptr;
+    bool bestHidden = false;
+    float bestScore = 0;
+    __try {
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto point = reinterpret_cast<const float*>(points + i * runInPointSize + runInPointPosition);
+            const float fromPlayer = distanceSquared(point, playerPosition);
+            if (fromPlayer < minimumHiddenDistance * minimumHiddenDistance) continue;
+            if (fromPlayer > maximumHiddenDistance * maximumHiddenDistance) continue;
+            if (isTaken(point, taken, takenCount)) continue;
+            const float sight = seen ? alongView(point, eye, view) : 0;
+            const bool hidden = sight < 0;
+            const float score = hidden ? (side ? distanceSquared(point, side) : fromPlayer) : sight;
+            if (best && (bestHidden && !hidden)) continue;
+            if (best && bestHidden == hidden && score >= bestScore) continue;
+            best = point;
+            bestHidden = hidden;
+            bestScore = score;
+        }
+        if (best) memcpy(position, best, sizeof(position));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        best = nullptr;
+    }
+    if (!best) {
+        pickNearestRunInPoint(playerPosition, position, taken, takenCount);
+        return true;
+    }
+    position[1] += spawnHeightOffset;
+    return true;
+}
+
+uint32_t listEntrances(float (*entrances)[3], uint32_t capacity) {
+    uint8_t* player = actorParam(playerActor);
+    if (!player) return 0;
+    const float* playerPosition = reinterpret_cast<const float*>(player + paramPosition);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < entranceTries; ++i) {
+        const float* entrance = randomEntrance();
+        if (!entrance || isTaken(entrance, entrances, count)) continue;
+        if (distanceSquared(entrance, playerPosition) < minimumRunInDistance * minimumRunInDistance) continue;
+        // Nearest first: insertion into the few found so far.
+        uint32_t slot = count < capacity ? count : capacity - 1;
+        if (count == capacity && distanceSquared(entrance, playerPosition) >= distanceSquared(entrances[slot], playerPosition))
+            continue;
+        while (slot > 0 && distanceSquared(entrance, playerPosition) < distanceSquared(entrances[slot - 1], playerPosition)) {
+            memcpy(entrances[slot], entrances[slot - 1], sizeof(entrances[slot]));
+            --slot;
+        }
+        memcpy(entrances[slot], entrance, sizeof(entrances[slot]));
+        entrances[slot][1] = entrance[1] + spawnHeightOffset;
+        if (count < capacity) ++count;
+    }
+    return count;
 }
 
 void setGameBase(uintptr_t base) {
@@ -395,20 +557,20 @@ void clearStoryRoles(uint8_t* param) {
 // As op 174 with mode 0 (0x412991): frees a character its script pinned in place.
 void unpin(int32_t actor) {
     uint8_t* entry = characterEntry(actor);
-    uint8_t* motion = entry ? at<uint8_t*>(entry, entryMotion) : nullptr;
-    if (!motion || at<int32_t>(motion, motionPinnedMode) == 0) return;
-    at<int32_t>(motion, motionPinnedMode) = 0;
     void* physics = global<void*>(physicsManager);
-    uint8_t* body = at<uint8_t*>(motion, motionBody);
-    if (!physics || !body) return;
-    const uint32_t bodyNumber = at<uint32_t>(body, 0x84);
     const uintptr_t pin = address(setBodyPinned);
     __try {
+        uint8_t* motion = entry ? at<uint8_t*>(entry, entryMotion) : nullptr;
+        if (!motion || at<int32_t>(motion, motionPinnedMode) == 0) return;
+        at<int32_t>(motion, motionPinnedMode) = 0;
+        uint8_t* body = at<uint8_t*>(motion, motionBody);
+        if (!physics || !body) return;
+        const uint32_t number = at<uint32_t>(body, bodyNumber);
         __asm {
             push ebx
             push edi
             mov edi, physics
-            mov ebx, bodyNumber
+            mov ebx, number
             push 0
             call pin
             pop edi
@@ -416,6 +578,38 @@ void unpin(int32_t actor) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+}
+
+// The weapon object in slot, or nullptr.
+uint8_t* weaponIn(uint8_t* param, uint32_t slotField) {
+    const uint32_t slot = at<uint32_t>(param, slotField);
+    return slot < weaponSlots ? at<uint8_t*>(param, paramWeapons + slot * 8) : nullptr;
+}
+
+bool modelBuilt(uint8_t* weapon) {
+    return !weapon || (at<uint32_t>(weapon, weaponModelFlags) & weaponModelBuilt) != 0;
+}
+
+SheathCheck settleSheath(int32_t actor) {
+    uint8_t* entry = characterEntry(actor);
+    uint8_t* param = entry ? at<uint8_t*>(entry, entryParam) : nullptr;
+    if (!param) return SheathCheck::waiting;
+    __try {
+        uint8_t* weapon = weaponIn(param, paramCurrentWeaponSlot);
+        if (!weapon) return SheathCheck::fine;
+        uint8_t* second = at<uint8_t>(param, paramHasSecondWeapon) ? weaponIn(param, paramSecondWeaponSlot) : nullptr;
+        if (!modelBuilt(weapon) || !modelBuilt(second)) return SheathCheck::waiting;
+        // Not drawn yet: its draw comes after the build and places the sheath itself.
+        if (at<uint8_t>(param, paramWeaponInHand) == 0) return SheathCheck::fine;
+        const uintptr_t attach = address(attachDrawnWeapon);
+        __asm {
+            push entry
+            call attach
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return SheathCheck::fine;
+    }
+    return SheathCheck::moved;
 }
 
 bool makeRushBoss(int32_t actor, uint8_t* param) {
@@ -434,23 +628,6 @@ bool makeRushBoss(int32_t actor, uint8_t* param) {
     return true;
 }
 
-// As the off-screen enemies are turned when they come in (0x436f1b..0x436f83): the flat direction
-// to the player in the matrix's first and third rows.
-void faceToward(uint8_t* boss, const uint8_t* player) {
-    const float* from = reinterpret_cast<const float*>(boss + paramPosition);
-    const float* to = reinterpret_cast<const float*>(player + paramPosition);
-    float dx = to[0] - from[0], dz = to[2] - from[2];
-    const float length = sqrtf(dx * dx + dz * dz);
-    if (length <= 0) return;
-    dx /= length;
-    dz /= length;
-    float* matrix = reinterpret_cast<float*>(boss + paramOrientation);
-    matrix[0] = dz;
-    matrix[2] = dx;
-    matrix[6] = -dx;
-    matrix[8] = dz;
-}
-
 // Several bosses take turns at the player as the game's waiting fighters do (0x20); a lone boss
 // always attacks.
 uint32_t battleFlagsFor(bool alone) {
@@ -465,12 +642,21 @@ void setOnPlayer(uint8_t* boss, uint8_t* player, bool alone) {
 }
 
 void sendAgainst(int32_t actor, uint8_t* boss, uint8_t* player, bool alone) {
+    // The game turns it toward the player (its target manager's turn flag 0x100): writing its
+    // orientation leaves its sheath behind, which follows another transform.
     if (!player) return;
-    faceToward(boss, player);
     at<uint8_t*>(boss, paramForcedTarget) = player;
     at<uint32_t>(boss, paramBattleFlags) = battleFlagsFor(alone);
     at<int32_t>(boss, paramBattleGroup) = bossGroup;
     at<int32_t>(player, paramBattleGroup) = playerGroup;
+}
+
+void leaveFight(uint8_t* boss) {
+    __try {
+        at<uint8_t*>(boss, paramForcedTarget) = nullptr;
+        at<uint32_t>(boss, paramBattleFlags) = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
 }
 
 int32_t battleGroup(const uint8_t* param) {
@@ -509,21 +695,8 @@ void removeActor(int32_t actor) {
     }
 }
 
-bool reportActor(int32_t actor, const uint8_t* param, ActorReport& report) {
-    __try {
-        uint8_t* writable = const_cast<uint8_t*>(param);
-        memcpy(report.position, writable + paramPosition, sizeof(report.position));
-        report.flags = at<uint32_t>(writable, paramFlags);
-        report.forcedTargetFlags = at<uint32_t>(writable, paramBattleFlags);
-        report.removalFlags = at<uint32_t>(writable, paramRemovalFlags);
-        report.roleFlags = at<uint32_t>(writable, paramDeathKeepsRecords);
-        uint8_t* brain = static_cast<uint8_t*>(brainOf(actor));
-        report.brainState = brain ? at<int32_t>(brain, brainState) : -1;
-        report.brainTarget = brain ? at<int32_t>(brain, brainTarget) : -1;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+const float* position(const uint8_t* param) {
+    return reinterpret_cast<const float*>(param + paramPosition);
 }
 
 bool setInflowStopped(bool stopped) {
@@ -547,20 +720,30 @@ bool actorName(const uint8_t* param, wchar_t (&name)[33]) {
 
 bool notify(const wchar_t* text) {
     uint8_t* service = global<uint8_t*>(notifications);
-    void* queue = service ? at<void*>(service, 0x30) : nullptr;
-    if (!queue || !at<void*>(queue, 0x0c)) return false;
+    void* queue = nullptr;
+    __try {
+        queue = service ? at<void*>(service, uiManagerNotificationQueue) : nullptr;
+        if (queue && !at<void*>(queue, notificationQueueReady)) queue = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (!queue) return false;
     uint8_t storage[gameStringSize] = {};
     uint8_t* string = storage;
     const uintptr_t make = address(makeGameString);
     const uintptr_t show = address(queueNotification);
     const uintptr_t release = address(freeGameString);
-    bool queued = false;
     __try {
         __asm {
             mov ecx, text
             push string
             call make
         }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    bool queued = false;
+    __try {
         __asm {
             push esi
             push ebx
@@ -573,12 +756,15 @@ bool notify(const wchar_t* text) {
             pop esi
         }
         queued = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    // Freed whether or not it was queued: the queue keeps its own copy.
+    __try {
         __asm {
             mov ecx, string
             call release
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
     }
     return queued;
 }

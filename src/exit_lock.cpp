@@ -17,6 +17,7 @@ constexpr uint8_t exitBlockReasonStart[] = {0x55, 0x8b, 0xec, 0x33, 0xc0};
 
 volatile LONG exitsLocked;
 void* originalExitBlockReason;
+uintptr_t hookedTarget;  // 0 until hooked
 
 __declspec(naked) void exitBlockReasonHook() {
     __asm {
@@ -45,12 +46,18 @@ bool installExitLock(const wots4::ModContext& context, void (*log)(const char* m
     void* function = reinterpret_cast<void*>(target);
     if ((initialized == MH_OK || initialized == MH_ERROR_ALREADY_INITIALIZED) &&
         MH_CreateHook(function, reinterpret_cast<void*>(exitBlockReasonHook), &originalExitBlockReason) == MH_OK &&
-        MH_EnableHook(function) == MH_OK)
+        MH_EnableHook(function) == MH_OK) {
+        hookedTarget = target;
         return true;
+    }
     MH_RemoveHook(function);
     context.host->releaseClaims(context.module);
     log("[WARN] The area exit check could not be hooked; the exits stay open during a rush.");
     return false;
+}
+
+void reclaimExitLock(const wots4::ModContext& context) {
+    if (hookedTarget) context.host->claim(context.module, hookedTarget, sizeof(exitBlockReasonStart));
 }
 
 void setExitsLocked(bool locked) {

@@ -7,6 +7,8 @@ namespace boss_rush {
 // Checks the code, reserves it and hooks it. False (and logged) if this exe differs or another
 // Mod already hooks it; the rush then runs with the exits open.
 bool installExitLock(const wots4::ModContext& context, void (*log)(const char* message));
+// Reserves the hooked code again after releaseClaims dropped every reservation of the Mod.
+void reclaimExitLock(const wots4::ModContext& context);
 void setExitsLocked(bool locked);
 
 }  // namespace boss_rush

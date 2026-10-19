@@ -1,6 +1,7 @@
 // Boss Rush: once the true route's ending was seen, the ghost of the graveyard offers to
 // fight the strong of a faction or of the town one after another.
 #include "exit_lock.h"
+#include "travel.h"
 #include "game_actors.h"
 #include "rush.h"
 #include <cstddef>
@@ -94,7 +95,7 @@ bool hostSupported(const wots4::ModContext* context) {
         return false;
     const wots4::HostApi& api = *context->host;
     constexpr size_t requiredSize = offsetof(wots4::HostApi, showConversationMenu) + sizeof(api.showConversationMenu);
-    return api.size >= requiredSize && api.version == wots4::modApiVersion && api.onFrame &&
+    return api.size >= requiredSize && api.version == wots4::modApiVersion && api.claim && api.releaseClaims && api.onFrame &&
         api.addConversationChoice && api.showConversationMenu;
 }
 
@@ -102,8 +103,14 @@ bool hostSupported(const wots4::ModContext* context) {
 
 extern "C" BOOL WINAPI ModInitialize(const wots4::ModContext* context) {
     if (!hostSupported(context)) {
-        if (context && context->host && context->host->log)
-            context->host->log(context->module, "[ERROR] This ModLoader has no conversation API; Boss Rush was refused. Update the ModLoader.");
+        if (context && context->host && context->host->log) {
+            char message[224];
+            sprintf_s(message,
+                "[ERROR] This ModLoader does not offer Mod API version %u with conversation choices and frame callbacks; "
+                "Boss Rush was refused. Use the ModLoader it was built for.",
+                wots4::modApiVersion);
+            context->host->log(context->module, message);
+        }
         return FALSE;
     }
     host = context->host;
@@ -122,6 +129,11 @@ extern "C" BOOL WINAPI ModInitialize(const wots4::ModContext* context) {
     }
     // Last, so that a refused initialization leaves no hook behind.
     boss_rush::installExitLock(*context, log);
+    if (!boss_rush::installTravel(*context, log)) {
+        // releaseClaims drops every reservation of the Mod, so the exit lock takes its own again.
+        host->releaseClaims(module);
+        boss_rush::reclaimExitLock(*context);
+    }
     log("[INFO] Boss Rush initialized: the ghost of the graveyard offers 強者たちと戦う after the true route's ending.");
     return TRUE;
 }

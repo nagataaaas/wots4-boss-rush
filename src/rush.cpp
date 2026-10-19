@@ -1,10 +1,9 @@
 #include "rush.h"
 #include "exit_lock.h"
 #include "game_actors.h"
+#include "travel.h"
 #include <cstdio>
-#include <cmath>
 #include <cstring>
-#include <string>
 
 namespace boss_rush {
 namespace {
@@ -14,24 +13,27 @@ constexpr ULONGLONG loadingTimeoutMs = 20000;  // Longer than any model load see
 // A corpse of a boss stays for the player to search, until the same boss comes in again; the
 // game brings in no second actor with the ID of one that is there (0x43a760).
 constexpr ULONGLONG corpseRemovalMs = 300;
+// The empty graveyard: the map change and its loading. The first stage already waits in the
+// graveyard as the screen comes back, a moment after the player can move (the area's characters
+// are rebuilt then).
+constexpr ULONGLONG travelTimeoutMs = 30000;
+// The map change blacks the screen out at once, so a notice comes first.
+constexpr ULONGLONG noticeBeforeTravelMs = 1500;
+constexpr wots4::LocalizedText travelNotice{L"強者たちが墓場で待っている……", L"The strong await you in the graveyard..."};
 // While the game brings an actor in, its parameters may be missing for a moment.
 constexpr ULONGLONG missingParamsLimitMs = 3000;
-// Prototype diagnostics: each boss's place and brain, once a second for the first seconds of a stage.
-constexpr ULONGLONG reportIntervalMs = 1000;
-constexpr uint32_t reportsPerStage = 15;
+// After the player falls, the bosses are kept off the body at most this long.
+constexpr ULONGLONG fallenPlayerWatchMs = 6000;
+// A boss that finds no way to the player would keep the exits locked for good: when no standing
+// boss comes this near the player for this long, the stage gives up. The bosses come in 50 to
+// 110 units away and fight within reach of a few units.
+constexpr float reachDistance = 30.0f;
+constexpr ULONGLONG unreachedLimitMs = 60000;
 
 constexpr wots4::LocalizedText allDefeated{L"強者たちをすべて倒した", L"You have defeated all the strong."};
+constexpr wots4::LocalizedText bossesGone{L"強者たちは姿を消した……", L"The strong have vanished..."};
 
-// Story state a boss's death may write, compared after each stage: the townspeople's records
-// (save 0x15c, 12 bytes each), the occupations' flags, and the main characters and factions.
-struct WatchedRange {
-    uint32_t offset;
-    uint32_t size;
-};
-constexpr WatchedRange watchedRanges[] = {{0x0100, 0x40}, {0x015c, 12 * 128}, {0x3740, 0x50}};
-constexpr uint32_t maxLoggedChanges = 16;
-
-enum class Phase { idle, clearing, loading, fighting, resting };
+enum class Phase { idle, announcing, travelling, clearing, loading, fighting, resting };
 
 struct Fighter {
     int32_t actor;
@@ -39,6 +41,8 @@ struct Fighter {
     bool down;
     float position[3];  // Where it comes in
     ULONGLONG missingSince;  // When its parameters went missing, or 0
+    bool sheathSettled;
+    int32_t groupBefore;  // Its battle group before the rush set it, put back when the player falls
 };
 
 struct Rush {
@@ -51,9 +55,9 @@ struct Rush {
     ULONGLONG phaseStart = 0;
     int32_t area = -1;
     int32_t playerGroupBefore = -1;  // The player's battle group, put back when the rush ends
-    ULONGLONG lastReport = 0;
-    uint32_t reportCount = 0;
-    uint8_t watched[0x40 + 12 * 128 + 0x50]{};
+    ULONGLONG lastReachedAt = 0;     // When a standing boss was last within reachDistance
+    uint32_t fallenWatchCount = 0;  // The fighters kept off the player's body after the fall
+    ULONGLONG fallenWatchUntil = 0;
 };
 
 Rush rush;
@@ -76,70 +80,32 @@ const wchar_t* inGameLanguage(const wots4::LocalizedText& text) {
     return game::textsInJapanese() ? text.japanese : text.english;
 }
 
-void copyWatched(uint8_t* target) {
-    const uint8_t* save = game::saveLayout();
-    if (!save) return;
-    for (const WatchedRange& range : watchedRanges) {
-        memcpy(target, save + range.offset, range.size);
-        target += range.size;
-    }
+bool withinReach(const uint8_t* boss, const uint8_t* player) {
+    const float* bossPosition = game::position(boss);
+    const float* playerPosition = game::position(player);
+    const float dx = bossPosition[0] - playerPosition[0];
+    const float dy = bossPosition[1] - playerPosition[1];
+    const float dz = bossPosition[2] - playerPosition[2];
+    return dx * dx + dy * dy + dz * dz <= reachDistance * reachDistance;
 }
 
-// Logs the story bytes that changed since the rush started. Diagnostics of the prototype.
-void logStoryChanges() {
-    uint8_t now[sizeof(rush.watched)];
-    copyWatched(now);
-    uint32_t index = 0, logged = 0, changed = 0;
-    for (const WatchedRange& range : watchedRanges) {
-        for (uint32_t i = 0; i < range.size; ++i, ++index) {
-            if (now[index] == rush.watched[index]) continue;
-            ++changed;
-            if (logged == maxLoggedChanges) continue;
-            ++logged;
-            char message[128];
-            sprintf_s(message, "[WARN] Story state changed during the rush: save offset 0x%04x from 0x%02x to 0x%02x.",
-                range.offset + i, rush.watched[index], now[index]);
-            logLine(message);
-        }
-    }
-    char message[128];
-    sprintf_s(message, "[INFO] Story state check after stage %u: %u byte(s) changed.", rush.stage + 1, changed);
-    logLine(message);
-}
-
-void reportFighters(const char* when) {
+// Each frame from the player's fall until the game takes the body away: the game sets a boss on
+// the fallen player again (its target choice 0x440440 skips only flags 0x3000000, which come
+// later), and it would keep cutting the body.
+void keepOffFallenPlayer() {
+    if (rush.fallenWatchCount == 0) return;
     const uint8_t* player = game::playerParam();
-    game::ActorReport playerReport{};
-    if (!player || !game::reportActor(0, player, playerReport)) return;
-    for (uint32_t i = 0; i < rush.fighterCount; ++i) {
-        const Fighter& fighter = rush.fighters[i];
-        const uint8_t* param = fighter.param ? fighter.param : game::actorParam(fighter.actor);
-        game::ActorReport report{};
-        if (!param || !game::reportActor(fighter.actor, param, report)) {
-            char message[96];
-            sprintf_s(message, "[DEBUG] %s: actor %d has no parameters yet.", when, fighter.actor);
-            logLine(message);
-            continue;
-        }
-        const float dx = report.position[0] - playerReport.position[0];
-        const float dy = report.position[1] - playerReport.position[1];
-        const float dz = report.position[2] - playerReport.position[2];
-        char message[320];
-        sprintf_s(message,
-            "[DEBUG] %s: actor %d at (%.1f, %.1f, %.1f), player at (%.1f, %.1f, %.1f), distance %.1f; "
-            "brain state %d, target %d; flags 0x%08x, battle flags 0x%08x, removal 0x%08x, roles 0x%08x.",
-            when, fighter.actor, report.position[0], report.position[1], report.position[2], playerReport.position[0],
-            playerReport.position[1], playerReport.position[2], sqrtf(dx * dx + dy * dy + dz * dz), report.brainState,
-            report.brainTarget, report.flags, report.forcedTargetFlags, report.removalFlags, report.roleFlags);
-        logLine(message);
+    if (!player || !game::fallen(player) || GetTickCount64() >= rush.fallenWatchUntil) {
+        rush.fallenWatchCount = 0;
+        return;
     }
-}
-
-void reportFightersEverySecond() {
-    if (rush.reportCount >= reportsPerStage || GetTickCount64() - rush.lastReport < reportIntervalMs) return;
-    rush.lastReport = GetTickCount64();
-    ++rush.reportCount;
-    reportFighters("fighting");
+    for (uint32_t i = 0; i < rush.fallenWatchCount; ++i) {
+        Fighter& fighter = rush.fighters[i];
+        // Looked up again: the bodies of the beaten ones may be gone.
+        fighter.param = game::actorParam(fighter.actor);
+        if (!fighter.param || game::defeated(fighter.param)) continue;
+        game::leaveFight(fighter.param);
+    }
 }
 
 void removeFighters() {
@@ -164,10 +130,11 @@ bool removeStageCorpses() {
     return removed;
 }
 
-void endRush(const char* reason, bool removeThem) {
+void endRush(const char* reason, bool removeThem, bool won = false) {
     if (removeThem) removeFighters();
     if (uint8_t* player = game::playerParam()) game::setBattleGroup(player, rush.playerGroupBefore);
     setExitsLocked(false);
+    endEmptyGraveyard(won);
     rush.fighterCount = 0;
     game::setInflowStopped(false);
     enterPhase(Phase::idle);
@@ -177,21 +144,16 @@ void endRush(const char* reason, bool removeThem) {
 bool queueStage() {
     const RushStage& stage = rush.roster.stages[rush.stage];
     rush.fighterCount = 0;
+    // The fighters take the entrances' sides in turn.
+    float entrances[maxStageFighters][3];
+    const uint32_t entranceCount = game::listEntrances(entrances, maxStageFighters);
     for (uint32_t i = 0; i < stage.fighterCount; ++i) {
         float position[3];
-        uint32_t runInPoints = 0;
         float taken[maxStageFighters][3];
         for (uint32_t j = 0; j < rush.fighterCount; ++j) memcpy(taken[j], rush.fighters[j].position, sizeof(taken[j]));
-        const game::SpawnPoint point = game::pickSpawnPoint(position, runInPoints, taken, rush.fighterCount);
-        const int32_t actor =
-            point == game::SpawnPoint::none ? game::noActor : game::queueActor(stage.definitions[i], position);
-        if (point != game::SpawnPoint::none) {
-            char where[192];
-            sprintf_s(where, "[DEBUG] Definition %u comes in at (%.1f, %.1f, %.1f): %s (the map has %u run-in point(s)).",
-                stage.definitions[i], position[0], position[1], position[2],
-                point == game::SpawnPoint::runIn ? "a run-in point" : "beside the player", runInPoints);
-            logLine(where);
-        }
+        const float* side = entranceCount > 0 ? entrances[i % entranceCount] : nullptr;
+        const bool placed = game::pickSpawnPoint(side, position, taken, rush.fighterCount);
+        const int32_t actor = placed ? game::queueActor(stage.definitions[i], position) : game::noActor;
         if (actor == game::noActor) {
             char message[160];
             sprintf_s(message, "[ERROR] The game did not bring in definition %u for stage %u; the rush stops.",
@@ -221,17 +183,56 @@ void updateClearing() {
     if (inPhaseMs() >= corpseRemovalMs) queueStage();
 }
 
+void updateAnnouncing() {
+    if (inPhaseMs() < noticeBeforeTravelMs) return;
+    if (!requestEmptyGraveyard()) {
+        logLine("[INFO] The map change could not be asked for; the rush starts in the graveyard as it is.");
+        bringInStage();
+        return;
+    }
+    enterPhase(Phase::travelling);
+    logLine("[INFO] The player is taken into an empty graveyard.");
+}
+
+// The first stage comes once the graveyard has loaded and the player can move.
+void updateTravelling() {
+    if (inPhaseMs() > travelTimeoutMs) {
+        endRush("[ERROR] The empty graveyard was not entered in 30 seconds; the rush stops.", false);
+        return;
+    }
+    const bool ready = emptyGraveyardEntered() && game::currentArea() == static_cast<int32_t>(game::graveyardArea) &&
+        game::freeToSpawn() && game::playerParam();
+    if (!ready) return;
+    const uint8_t* player = game::playerParam();
+    rush.playerGroupBefore = game::battleGroup(player);
+    logLine("[INFO] The empty graveyard is ready; the first stage waits in it.");
+    bringInStage();
+}
+
 void announceStage() {
     const RushStage& stage = rush.roster.stages[rush.stage];
-    std::wstring text;
+    wchar_t name[33];
+    const wchar_t* text = nullptr;
     if (stage.title.japanese) {
         text = inGameLanguage(stage.title);
-    } else {
-        wchar_t name[33];
-        if (!game::actorName(rush.fighters[0].param, name)) return;
+    } else if (game::actorName(rush.fighters[0].param, name)) {
         text = name;
     }
-    if (!game::notify(text.c_str())) logLine("[WARN] The stage's notification could not be shown.");
+    if (!text) return;
+    if (!game::notify(text)) logLine("[WARN] The stage's notification could not be shown.");
+}
+
+void settleSheath(Fighter& fighter) {
+    if (fighter.sheathSettled) return;
+    fighter.sheathSettled = game::settleSheath(fighter.actor) != game::SheathCheck::waiting;
+}
+
+// Once: the brain starts the AI's battle mode itself while it fights (0x409290), and each order
+// rebuilds the AI's parts. The order also drops the walk it came in with.
+void charge(Fighter& fighter) {
+    fighter.groupBefore = game::battleGroup(fighter.param);
+    if (!game::orderToFight(fighter.actor)) logLine("[WARN] A boss's AI was not found; it may not fight.");
+    game::sendAgainst(fighter.actor, fighter.param, game::playerParam(), rush.fighterCount == 1);
 }
 
 void updateLoading() {
@@ -252,25 +253,35 @@ void updateLoading() {
             endRush("[ERROR] A boss's action script could not be changed; the rush stops.", true);
             return;
         }
-        // Once: the brain starts the AI's battle mode itself while it fights (0x409290), and each
-        // order rebuilds the AI's parts.
-        if (!game::orderToFight(fighter.actor)) logLine("[WARN] A boss's AI was not found; it may not fight.");
-        game::sendAgainst(fighter.actor, param, game::playerParam(), rush.fighterCount == 1);
         fighter.param = param;
+        charge(fighter);
     }
     if (allReady) {
-        reportFighters("loaded");
-        rush.reportCount = 0;
-        rush.lastReport = 0;
         announceStage();
         enterPhase(Phase::fighting);
+        rush.lastReachedAt = GetTickCount64();
         return;
     }
     if (inPhaseMs() > loadingTimeoutMs) endRush("[ERROR] The bosses did not finish loading in 20 seconds; the rush stops.", true);
 }
 
+uint32_t standingFighters() {
+    uint32_t standing = 0;
+    for (uint32_t i = 0; i < rush.fighterCount; ++i) standing += rush.fighters[i].down ? 0 : 1;
+    return standing;
+}
+
+void giveUpUnreachedStage() {
+    game::notify(inGameLanguage(bossesGone));
+    endRush("[WARN] No boss came within 30 units of the player for 60 seconds; the bosses were removed and the exits opened.",
+        true);
+}
+
 void updateFighting() {
     uint8_t* player = game::playerParam();
+    // The game gives the attack only to the fighter the player targets (0x440270): the last one
+    // standing is told to attack anyway.
+    const bool alone = standingFighters() == 1;
     bool anyStanding = false;
     for (uint32_t i = 0; i < rush.fighterCount; ++i) {
         Fighter& fighter = rush.fighters[i];
@@ -296,15 +307,16 @@ void updateFighting() {
             logLine(message);
             continue;
         }
-        game::keepFighting(fighter.param, player, rush.fighterCount == 1);
         anyStanding = true;
+        settleSheath(fighter);
+        game::keepFighting(fighter.param, player, alone);
+        if (player && withinReach(fighter.param, player)) rush.lastReachedAt = GetTickCount64();
     }
-    if (anyStanding) {
-        reportFightersEverySecond();
+    if (!anyStanding) {
+        enterPhase(Phase::resting);
         return;
     }
-    logStoryChanges();
-    enterPhase(Phase::resting);
+    if (GetTickCount64() - rush.lastReachedAt >= unreachedLimitMs) giveUpUnreachedStage();
 }
 
 void updateResting() {
@@ -316,7 +328,7 @@ void updateResting() {
     game::notify(inGameLanguage(allDefeated));
     char message[96];
     sprintf_s(message, "[INFO] The player defeated every stage of the %s.", groupName(rush.group));
-    endRush(message, false);
+    endRush(message, false, true);
 }
 
 }  // namespace
@@ -337,14 +349,23 @@ bool startRush(RushGroup group, LogFunction logFunction) {
     rush.area = game::currentArea();
     const uint8_t* player = game::playerParam();
     rush.playerGroupBefore = player ? game::battleGroup(player) : -1;
-    copyWatched(rush.watched);
     game::setInflowStopped(true);
     setExitsLocked(true);
+    if (travelAvailable()) {
+        game::notify(inGameLanguage(travelNotice));
+        enterPhase(Phase::announcing);
+        return true;
+    }
+    logLine("[INFO] The rush starts in the graveyard as it is.");
     return bringInStage();
 }
 
 void updateRush() {
-    if (rush.phase == Phase::idle) return;
+    if (rush.phase == Phase::idle) {
+        keepOffFallenPlayer();
+        updateGraveyardReturn();
+        return;
+    }
     if (game::currentArea() != rush.area) {
         endRush("[INFO] The player left the area; the rush ends.", false);
         return;
@@ -353,10 +374,23 @@ void updateRush() {
     // From the first frame without HP: the bosses stop being set on the player while the game
     // takes them out of the fight.
     if (player && game::fallen(player)) {
+        for (uint32_t i = 0; i < rush.fighterCount; ++i) {
+            Fighter& fighter = rush.fighters[i];
+            if (!fighter.param || fighter.down) continue;
+            fighter.param = game::actorParam(fighter.actor);  // The game may move it
+            if (!fighter.param) continue;
+            game::leaveFight(fighter.param);
+            game::setBattleGroup(fighter.param, fighter.groupBefore);
+        }
+        // endRush forgets the fighters but leaves them in the array, which keepOffFallenPlayer reads.
+        rush.fallenWatchCount = rush.fighterCount;
+        rush.fallenWatchUntil = GetTickCount64() + fallenPlayerWatchMs;
         endRush("[INFO] The player fell; the rush ends and the game goes on as usual.", false);
         return;
     }
     switch (rush.phase) {
+    case Phase::announcing: updateAnnouncing(); break;
+    case Phase::travelling: updateTravelling(); break;
     case Phase::clearing: updateClearing(); break;
     case Phase::loading: updateLoading(); break;
     case Phase::fighting: updateFighting(); break;
